@@ -423,6 +423,8 @@ def cmd_record_decision(args: argparse.Namespace) -> int:
     if args.hashes:
         ev["hashes"] = args.hashes.split(",")
     append_event(run_dir, ev)
+    manifest.setdefault("decisions", []).append(ev)
+    save_manifest(run_dir, manifest)
     print(json.dumps(ev, indent=2))
     return 0
 
@@ -756,6 +758,290 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0 if not fails else 1
 
 
+# --------------------------------------------------------------------------- graph
+# Graph extraction + rendering from a run's manifest.
+#
+# Nodes: run, execution, artifact, environment, decision.
+# Edges:
+#   execution --produces--> artifact   (output with sha256)
+#   artifact  --consumed-by--> execution (input with sha256)
+#   execution --env--> environment      (by env name if recorded)
+#   decision  --motivated-by--> execution (by decision_id if referenced in notes)
+#   run       --contains--> execution
+# Implicit execution-dependency edges: exec B's input hash == exec A's output hash
+#   => A --> B (the pipeline DAG). Computed by hash matching.
+
+
+def graph_extract(manifest: dict) -> dict:
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen: set[str] = set()
+
+    def add_node(kind: str, nid: str, label: str, **kw):
+        if nid in seen:
+            return
+        seen.add(nid)
+        nodes.append({"kind": kind, "id": nid, "label": label, **kw})
+
+    def add_edge(src: str, dst: str, rel: str, **kw):
+        edges.append({"src": src, "dst": dst, "rel": rel, **kw})
+
+    run_id = manifest.get("run_id") or os.path.basename(
+        os.path.dirname(manifest.get("manifest_path", ".")))
+    add_node("run", "run", run_id,
+             seed=manifest.get("seed"), question=manifest.get("research_question"))
+
+    execs = manifest.get("executions", [])
+    envs = manifest.get("environment", {}).get("captures", [])
+    decs = manifest.get("decisions", [])
+
+    for e in envs:
+        nid = "env_" + str(e.get("method") or "") + "_" + str(e.get("name") or e.get("image") or e.get("path") or "")
+        nid = re.sub(r"[^A-Za-z0-9_]", "_", nid)
+        add_node("environment", nid, e.get("method", "env"),
+                 confidence=e.get("confidence"), error=e.get("error"),
+                 sha256=e.get("sha256", "")[:12])
+
+    for d in decs:
+        nid = d.get("decision_id", "dec")
+        add_node("decision", nid, d.get("decision_id"),
+                 confidence=d.get("confidence"), choice=d.get("choice") or "")
+
+    art_meta = manifest.get("artifacts", {})
+
+    for x in execs:
+        nid = x.get("execution_id", "")
+        label = f"{nid}: {x.get('name','')}"
+        add_node("execution", nid, label,
+                 cmd=x.get("command", ""), exit_code=x.get("exit_code"),
+                 label_e=x.get("evidence_label"), env=x.get("env"),
+                 seed=x.get("seed"), expected_nondet=x.get("expected_nondeterministic", False))
+        add_edge("run", nid, "contains")
+        for o in x.get("outputs", []):
+            if "sha256" not in o:
+                continue
+            aid = o["sha256"]
+            add_node("artifact", "art_" + aid[:12], o.get("path", aid[:12]),
+                     sha256=aid, size=o.get("size_bytes"), role="output")
+            add_edge(nid, "art_" + aid[:12], "produces", path=o.get("path"))
+        for i in x.get("inputs", []):
+            if "sha256" not in i:
+                continue
+            aid = i["sha256"]
+            add_node("artifact", "art_" + aid[:12], i.get("path", aid[:12]),
+                     sha256=aid, size=i.get("size_bytes"), role="input")
+            add_edge("art_" + aid[:12], nid, "consumed-by", path=i.get("path"))
+        # execution -> env edge by recorded env name
+        if x.get("env"):
+            for e in envs:
+                if str(e.get("name") or "") == str(x["env"]):
+                    add_edge(nid, "env_" + str(e.get("method")) + "_" + str(e.get("name")), "env", env_name=x["env"])
+        # decision -> execution edge when decision referenced (notes contain decision_id)
+        notes = str(x.get("notes") or "")
+        for d in decs:
+            if d.get("decision_id") and d["decision_id"] in notes:
+                add_edge(d.get("decision_id"), nid, "motivated")
+
+    # Implicit execution dependencies via output->input hash match
+    out_map: dict[str, str] = {}   # sha -> producing exec
+    for x in execs:
+        for o in x.get("outputs", []):
+            if "sha256" in o:
+                out_map[o["sha256"]] = x["execution_id"]
+    in_map: dict[str, list[str]] = {}  # sha -> consuming execs
+    for x in execs:
+        for i in x.get("inputs", []):
+            if "sha256" in i:
+                in_map.setdefault(i["sha256"], []).append(x["execution_id"])
+    for h, prod in out_map.items():
+        for cons in in_map.get(h, []):
+            if prod != cons:
+                add_edge(prod, cons, "depends-on")
+
+    return {"run_id": run_id, "nodes": nodes, "edges": edges}
+
+
+def _esc(s: str) -> str:
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def render_mermaid(g: dict) -> str:
+    color = {"run": "#f9f0ff", "execution": "#e6f2ff", "artifact": "#e6ffe6",
+             "environment": "#fff7e6", "decision": "#ffe6e6"}
+    border = {"run": "#9b59b6", "execution": "#2e86c1", "artifact": "#27ae60",
+              "environment": "#e67e22", "decision": "#c0392b"}
+    L = ["```mermaid", "flowchart LR"]
+    for n in g["nodes"]:
+        lbl = n["label"]
+        if n["kind"] == "execution":
+            lbl = f"{n['label']}<br/>exit={n.get('exit_code')} [{n.get('label_e')}]"
+        if n["kind"] == "artifact":
+            lbl = f"{n['label']}<br/>{n.get('sha256','')[:12]}"
+        if n["kind"] == "environment" and n.get("error"):
+            lbl = f"{n['label']}<br/>ERROR: {n['error']}"
+        L.append(f'    {n["id"]}["{lbl}"]:::{n["kind"]}')
+    for e in g["edges"]:
+        L.append(f'    {e["src"]} -->|{e["rel"]}| {e["dst"]}')
+    L.append("    classDef run fill:#f9f0ff,stroke:#9b59b6;")
+    L.append("    classDef execution fill:#e6f2ff,stroke:#2e86c1;")
+    L.append("    classDef artifact fill:#e6ffe6,stroke:#27ae60;")
+    L.append("    classDef environment fill:#fff7e6,stroke:#e67e22;")
+    L.append("    classDef decision fill:#ffe6e6,stroke:#c0392b;")
+    L.append("```")
+    return "\n".join(L)
+
+
+def render_dot(g: dict) -> str:
+    color = {"run": "#f9f0ff", "execution": "#e6f2ff", "artifact": "#e6ffe6",
+             "environment": "#fff7e6", "decision": "#ffe6e6"}
+    L = ['digraph G {', '  rankdir=LR;', '  node [shape=box, style="rounded,filled", fontname="Helvetica"];', '  edge [color="#666666"];']
+    for n in g["nodes"]:
+        L.append(f'  {n["id"]} [label="{_esc(n["label"])}", fillcolor="{color[n["kind"]]}"];')
+    for e in g["edges"]:
+        L.append(f'  {e["src"]} -> {e["dst"]} [label="{e["rel"]}"];')
+    L.append("}")
+    return "\n".join(L)
+
+
+def render_ascii(g: dict) -> str:
+    # Layered view: run -> executions with their inputs/outputs indented.
+    L = [f"{g['run_id']} (run)"]
+    for n in g["nodes"]:
+        if n["kind"] != "execution":
+            continue
+        L.append(f"  {n['label']}  [{n.get('label_e')}] exit={n.get('exit_code')} env={n.get('env') or '-'} seed={n.get('seed') or '-'}")
+        for e in g["edges"]:
+            if e["src"] == n["id"] and e["rel"] == "produces":
+                art = next((a for a in g["nodes"] if a["id"] == e["dst"]), None)
+                L.append(f"    -> {e['rel']}: {art['label'] if art else e['dst']}  [{art.get('sha256','')[:12] if art else ''}]") if art else None
+        for e in g["edges"]:
+            if e["dst"] == n["id"] and e["rel"] == "consumed-by":
+                art = next((a for a in g["nodes"] if a["id"] == e["src"]), None)
+                L.append(f"    <- {e['rel']}: {art['label'] if art else e['src']}  [{art.get('sha256','')[:12] if art else ''}]") if art else None
+    # dependency edges
+    deps = [e for e in g["edges"] if e["rel"] == "depends-on"]
+    if deps:
+        L.append("  pipeline: " + " -> ".join(f"{e['src']}->{e['dst']}" for e in deps))
+    return "\n".join(L)
+
+
+def render_json(g: dict) -> str:
+    return json.dumps(g, indent=2)
+
+
+def _layered_layout(g: dict) -> tuple[dict, dict]:
+    """Minimal longest-path layering (stdlib-only). Returns {id:(x,y)} and {id:(w,h)}."""
+    preds: dict[str, list[str]] = {n["id"]: [] for n in g["nodes"]}
+    for e in g["edges"]:
+        preds.setdefault(e["dst"], []).append(e["src"])
+    layer: dict[str, int] = {}
+    for n in g["nodes"]:
+        layer[n["id"]] = 0
+    # longest path (simple fixed-point; graphs here are small DAGs)
+    changed = True
+    while changed:
+        changed = False
+        for n in g["nodes"]:
+            for p in preds.get(n["id"], []):
+                if layer[p] + 1 > layer[n["id"]]:
+                    layer[n["id"]] = layer[p] + 1
+                    changed = True
+    layers: dict[int, list[str]] = {}
+    for nid, l in layer.items():
+        layers.setdefault(l, []).append(nid)
+    pos: dict[str, tuple[float, float]] = {}
+    size: dict[str, tuple[float, float]] = {}
+    W, H = 220.0, 70.0
+    for l, ids in sorted(layers.items()):
+        for i, nid in enumerate(ids):
+            pos[nid] = (l * (W + 60) + 20, i * (H + 40) + 20)
+            size[nid] = (W, H)
+    return pos, size
+
+
+def render_html(g: dict) -> str:
+    pos, size = _layered_layout(g)
+    W = max((p[0] + s[0] for p, s in zip(pos.values(), size.values())), default=200) + 40
+    H = max((p[1] + s[1] for p, s in zip(pos.values(), size.values())), default=200) + 40
+    fill = {"run": "#f9f0ff", "execution": "#e6f2ff", "artifact": "#e6ffe6",
+            "environment": "#fff7e6", "decision": "#ffe6e6"}
+    stroke = {"run": "#9b59b6", "execution": "#2e86c1", "artifact": "#27ae60",
+              "environment": "#e67e22", "decision": "#c0392b"}
+    parts = []
+    for e in g["edges"]:
+        if e["src"] not in pos or e["dst"] not in pos:
+            continue
+        (x1, y1), (x2, y2) = pos[e["src"]], pos[e["dst"]]
+        s1, s2 = size[e["src"]], size[e["dst"]]
+        # edge from right of src to left of dst
+        mx, my = (x1 + s1[0] + x2) / 2, (y1 + s1[1] / 2 + y2 + s2[1] / 2) / 2
+        d = f'M{x1 + s1[0]},{y1 + s1[1] / 2} C{mx},{y1 + s1[1] / 2} {mx},{y2 + s2[1] / 2} {x2},{y2 + s2[1] / 2}'
+        parts.append(f'<path d="{d}" fill="none" stroke="#999" stroke-width="1.2"/>')
+        parts.append(f'<text x="{mx}" y="{(y1 + s1[1] / 2 + y2 + s2[1] / 2) / 2 - 6}" font-size="10" fill="#666" text-anchor="middle">{_esc(e["rel"])}</text>')
+    for n in g["nodes"]:
+        x, y = pos[n["id"]]
+        w, h = size[n["id"]]
+        title = n["label"]
+        if n["kind"] == "artifact":
+            title = f"{n['label']}\nsha256: {n.get('sha256','')}"
+        if n["kind"] == "execution":
+            title = f"{n['label']}\nexit={n.get('exit_code')} [{n.get('label_e')}]\n{n.get('cmd','')}"
+        parts.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" fill="{fill[n["kind"]]}" stroke="{stroke[n["kind"]]}" stroke-width="1.5"><title>{_esc(title)}</title></rect>')
+        parts.append(f'<text x="{x + 8}" y="{y + 18}" font-size="11" font-family="sans-serif">{_esc(n["label"])}</text>')
+        if n["kind"] == "execution":
+            parts.append(f'<text x="{x + 8}" y="{y + 36}" font-size="9" font-family="monospace" fill="#444">exit={n.get("exit_code")} [{n.get("label_e")}]</text>')
+            parts.append(f'<text x="{x + 8}" y="{y + 50}" font-size="9" font-family="monospace" fill="#666">{_esc(n.get("cmd",""))[:36]}</text>')
+        if n["kind"] == "artifact":
+            parts.append(f'<text x="{x + 8}" y="{y + 36}" font-size="9" font-family="monospace" fill="#666">{n.get("sha256","")[:12]}</text>')
+        if n["kind"] == "environment":
+            parts.append(f'<text x="{x + 8}" y="{y + 36}" font-size="9" font-family="monospace" fill="#666">conf={n.get("confidence") or "-"}{(" ERROR" if n.get("error") else "")}</text>')
+        if n["kind"] == "decision":
+            parts.append(f'<text x="{x + 8}" y="{y + 36}" font-size="9" font-family="monospace" fill="#666">conf={n.get("confidence") or "-"}</text>')
+    svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}">' + "".join(parts) + "</svg>"
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Reproducibility graph — {_esc(g['run_id'])}</title>
+<style>body{{font-family:sans-serif;margin:24px}} h1{{font-size:18px}} .legend span{{display:inline-block;padding:2px 10px;margin-right:8px;border-radius:6px;font-size:12px}}</style>
+</head><body>
+<h1>Reproducibility graph — {_esc(g['run_id'])}</h1>
+<div class="legend">
+  <span style="background:#f9f0ff;border:1px solid #9b59b6">run</span>
+  <span style="background:#e6f2ff;border:1px solid #2e86c1">execution</span>
+  <span style="background:#e6ffe6;border:1px solid #27ae60">artifact</span>
+  <span style="background:#fff7e6;border:1px solid #e67e22">environment</span>
+  <span style="background:#ffe6e6;border:1px solid #c0392b">decision</span>
+</div>
+{svg}
+<p style="font-size:11px;color:#666">Hover a node for sha256 / exit code / command. Edge labels: produces / consumed-by / env / depends-on.</p>
+</body></html>"""
+
+
+def cmd_graph(args: argparse.Namespace) -> int:
+    run_dir = _run_dir(args.run)
+    manifest = load_manifest(run_dir)
+    g = graph_extract(manifest)
+    out = None
+    if args.format == "mermaid":
+        text = render_mermaid(g)
+        out = os.path.join(run_dir, "graph.mmd")
+    elif args.format == "dot":
+        text = render_dot(g)
+        out = os.path.join(run_dir, "graph.dot")
+    elif args.format == "html":
+        text = render_html(g)
+        out = os.path.join(run_dir, "graph.html")
+    elif args.format == "ascii":
+        text = render_ascii(g)
+        out = os.path.join(run_dir, "graph.txt")
+    else:
+        text = render_json(g)
+        out = os.path.join(run_dir, "graph.json")
+    with open(out, "w") as f:
+        f.write(text + ("\n" if args.format != "html" else ""))
+    append_event(run_dir, {"event": "graph_rendered", "format": args.format, "out": out})
+    print(out)
+    return 0
+
+
 # --------------------------------------------------------------------------- report
 
 def _figure_map(manifest: dict) -> list[dict]:
@@ -927,6 +1213,12 @@ def main(argv: list[str] | None = None) -> int:
     pck = sub.add_parser("check", help="audit a run for provenance discipline (linter)")
     pck.add_argument("--run", required=True, help="run id or path")
     pck.set_defaults(fn=cmd_check)
+
+    pg = sub.add_parser("graph", help="render the reproducibility graph")
+    pg.add_argument("--run", required=True, help="run id or path")
+    pg.add_argument("--format", choices=["mermaid", "dot", "html", "ascii", "json"],
+                    default="mermaid", help="output format")
+    pg.set_defaults(fn=cmd_graph)
 
     pr = sub.add_parser("report", help="emit reproducibility appendix")
     pr.add_argument("--run", required=True, help="run id or path")

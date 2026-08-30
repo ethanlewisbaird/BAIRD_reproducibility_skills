@@ -2,7 +2,7 @@
 
 Seven composable agent skills that record, verify, and report scientific provenance for agent-driven bioinformatics work. Designed for pi (Agent Skills standard), but the runtime is a standalone Python script usable by any agent harness or directly from the shell.
 
-## The seven skills
+## The eight skills
 
 | skill | lifecycle step | what it does |
 |-------|---------------|--------------|
@@ -12,6 +12,7 @@ Seven composable agent skills that record, verify, and report scientific provena
 | `provenance-adopt` | integrate non-agentic work | record human/GUI/slurm work after the fact with `adopted`/`inferred` labels |
 | `provenance-verify` | check it | integrity check (artifacts still match hashes) + optional `--rerun` (re-run and compare output hashes) |
 | `provenance-check` | audit discipline | linter: evidence labels, secret hygiene, hashing, env capture, reproduction handling |
+| `provenance-graph` | visualize it | render the lineage graph: Mermaid / Graphviz DOT / self-contained HTML / ASCII / JSON |
 | `provenance-report` | explain it | emit a Markdown reproducibility appendix: figure → script → env → data → seed map, decisions, verdicts |
 
 ## Architecture: LLM decides, runtime executes
@@ -74,7 +75,10 @@ provenance.py verify --run <run> --rerun
 # 6. audit discipline (linter) — catches secrets, mislabels, gaps
 provenance.py check --run <run>
 
-# 7. report the appendix
+# 7. visualize the lineage (mermaid for appendix, dot for figure, html for reviewers)
+provenance.py graph --run <run> --format mermaid
+
+# 8. report the appendix
 provenance.py report --run <run>
 ```
 
