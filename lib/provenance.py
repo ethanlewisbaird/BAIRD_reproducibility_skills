@@ -929,90 +929,312 @@ def render_json(g: dict) -> str:
     return json.dumps(g, indent=2)
 
 
-def _layered_layout(g: dict) -> tuple[dict, dict]:
-    """Minimal longest-path layering (stdlib-only). Returns {id:(x,y)} and {id:(w,h)}."""
-    preds: dict[str, list[str]] = {n["id"]: [] for n in g["nodes"]}
-    for e in g["edges"]:
-        preds.setdefault(e["dst"], []).append(e["src"])
-    layer: dict[str, int] = {}
-    for n in g["nodes"]:
-        layer[n["id"]] = 0
-    # longest path (simple fixed-point; graphs here are small DAGs)
-    changed = True
-    while changed:
-        changed = False
-        for n in g["nodes"]:
-            for p in preds.get(n["id"], []):
-                if layer[p] + 1 > layer[n["id"]]:
-                    layer[n["id"]] = layer[p] + 1
-                    changed = True
-    layers: dict[int, list[str]] = {}
-    for nid, l in layer.items():
-        layers.setdefault(l, []).append(nid)
-    pos: dict[str, tuple[float, float]] = {}
-    size: dict[str, tuple[float, float]] = {}
-    W, H = 220.0, 70.0
-    for l, ids in sorted(layers.items()):
-        for i, nid in enumerate(ids):
-            pos[nid] = (l * (W + 60) + 20, i * (H + 40) + 20)
-            size[nid] = (W, H)
-    return pos, size
-
-
 def render_html(g: dict) -> str:
-    pos, size = _layered_layout(g)
-    W = max((p[0] + s[0] for p, s in zip(pos.values(), size.values())), default=200) + 40
-    H = max((p[1] + s[1] for p, s in zip(pos.values(), size.values())), default=200) + 40
-    fill = {"run": "#f9f0ff", "execution": "#e6f2ff", "artifact": "#e6ffe6",
-            "environment": "#fff7e6", "decision": "#ffe6e6"}
-    stroke = {"run": "#9b59b6", "execution": "#2e86c1", "artifact": "#27ae60",
-              "environment": "#e67e22", "decision": "#c0392b"}
-    parts = []
-    for e in g["edges"]:
-        if e["src"] not in pos or e["dst"] not in pos:
-            continue
-        (x1, y1), (x2, y2) = pos[e["src"]], pos[e["dst"]]
-        s1, s2 = size[e["src"]], size[e["dst"]]
-        # edge from right of src to left of dst
-        mx, my = (x1 + s1[0] + x2) / 2, (y1 + s1[1] / 2 + y2 + s2[1] / 2) / 2
-        d = f'M{x1 + s1[0]},{y1 + s1[1] / 2} C{mx},{y1 + s1[1] / 2} {mx},{y2 + s2[1] / 2} {x2},{y2 + s2[1] / 2}'
-        parts.append(f'<path d="{d}" fill="none" stroke="#999" stroke-width="1.2"/>')
-        parts.append(f'<text x="{mx}" y="{(y1 + s1[1] / 2 + y2 + s2[1] / 2) / 2 - 6}" font-size="10" fill="#666" text-anchor="middle">{_esc(e["rel"])}</text>')
-    for n in g["nodes"]:
-        x, y = pos[n["id"]]
-        w, h = size[n["id"]]
-        title = n["label"]
-        if n["kind"] == "artifact":
-            title = f"{n['label']}\nsha256: {n.get('sha256','')}"
-        if n["kind"] == "execution":
-            title = f"{n['label']}\nexit={n.get('exit_code')} [{n.get('label_e')}]\n{n.get('cmd','')}"
-        parts.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="8" fill="{fill[n["kind"]]}" stroke="{stroke[n["kind"]]}" stroke-width="1.5"><title>{_esc(title)}</title></rect>')
-        parts.append(f'<text x="{x + 8}" y="{y + 18}" font-size="11" font-family="sans-serif">{_esc(n["label"])}</text>')
-        if n["kind"] == "execution":
-            parts.append(f'<text x="{x + 8}" y="{y + 36}" font-size="9" font-family="monospace" fill="#444">exit={n.get("exit_code")} [{n.get("label_e")}]</text>')
-            parts.append(f'<text x="{x + 8}" y="{y + 50}" font-size="9" font-family="monospace" fill="#666">{_esc(n.get("cmd",""))[:36]}</text>')
-        if n["kind"] == "artifact":
-            parts.append(f'<text x="{x + 8}" y="{y + 36}" font-size="9" font-family="monospace" fill="#666">{n.get("sha256","")[:12]}</text>')
-        if n["kind"] == "environment":
-            parts.append(f'<text x="{x + 8}" y="{y + 36}" font-size="9" font-family="monospace" fill="#666">conf={n.get("confidence") or "-"}{(" ERROR" if n.get("error") else "")}</text>')
-        if n["kind"] == "decision":
-            parts.append(f'<text x="{x + 8}" y="{y + 36}" font-size="9" font-family="monospace" fill="#666">conf={n.get("confidence") or "-"}</text>')
-    svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}">' + "".join(parts) + "</svg>"
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Reproducibility graph — {_esc(g['run_id'])}</title>
-<style>body{{font-family:sans-serif;margin:24px}} h1{{font-size:18px}} .legend span{{display:inline-block;padding:2px 10px;margin-right:8px;border-radius:6px;font-size:12px}}</style>
-</head><body>
-<h1>Reproducibility graph — {_esc(g['run_id'])}</h1>
-<div class="legend">
-  <span style="background:#f9f0ff;border:1px solid #9b59b6">run</span>
-  <span style="background:#e6f2ff;border:1px solid #2e86c1">execution</span>
-  <span style="background:#e6ffe6;border:1px solid #27ae60">artifact</span>
-  <span style="background:#fff7e6;border:1px solid #e67e22">environment</span>
-  <span style="background:#ffe6e6;border:1px solid #c0392b">decision</span>
+    """Data/view-split interactive viewer.
+
+    Embeds the graph as JSON + a small vanilla-JS viewer (no external deps).
+    Designed for scale: you never render the whole graph — you navigate it.
+    - View modes: Pipeline (execs + depends-on only), Full, Focus (ego graph).
+    - Pan/zoom, search, type filters, failures-only, detail panel, crumbs.
+    """
+    data_json = json.dumps(g).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    run_id = _esc(g["run_id"])
+    return _HTML_TEMPLATE.replace("__RUN__", run_id).replace("__DATA__", data_json)
+
+
+_HTML_TEMPLATE = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reproducibility graph — __RUN__</title>
+<style>
+  :root { --run:#9b59b6; --exec:#2e86c1; --art:#27ae60; --env:#e67e22; --dec:#c0392b; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,Segoe UI,Helvetica,Arial,sans-serif; background:#fafafa; color:#222; }
+  header { padding:10px 16px; background:#fff; border-bottom:1px solid #ddd; display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  h1 { font-size:15px; margin:0; }
+  #stats { font-size:12px; color:#666; }
+  #controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-size:12px; }
+  #controls button { font-size:12px; padding:3px 10px; border:1px solid #bbb; border-radius:5px; background:#fff; cursor:pointer; }
+  #controls button.active { background:#2e86c1; color:#fff; border-color:#2e86c1; }
+  #controls label { display:inline-flex; align-items:center; gap:3px; }
+  #search { padding:4px 8px; border:1px solid #bbb; border-radius:5px; font-size:12px; width:200px; }
+  #crumbs { font-size:12px; color:#555; }
+  #crumbs button { border:none; background:none; color:#2e86c1; cursor:pointer; font-size:12px; padding:0 4px; }
+  #detail { position:fixed; right:12px; top:64px; width:340px; max-height:72vh; overflow:auto; background:#fff; border:1px solid #ddd; border-radius:8px; padding:12px; font-size:12px; box-shadow:0 2px 8px rgba(0,0,0,.15); display:none; z-index:10; }
+  #detail h3 { margin:0 0 8px; font-size:14px; }
+  #detail table { width:100%; border-collapse:collapse; }
+  #detail td { padding:2px 4px; vertical-align:top; word-break:break-all; }
+  #detail td:first-child { color:#666; width:80px; font-weight:600; }
+  #graphwrap { position:relative; }
+  svg#graph { display:block; width:100%; height:calc(100vh - 120px); background:#fff; cursor:grab; }
+  svg#graph.panning { cursor:grabbing; }
+  .node { cursor:pointer; }
+  .node rect { stroke-width:1.5; }
+  .node text { font-family:system-ui,sans-serif; pointer-events:none; }
+  .node .t { font-size:11px; fill:#222; }
+  .node .s { font-size:9px; fill:#777; font-family:ui-monospace,monospace; }
+  .edge { stroke:#999; stroke-width:1.2; fill:none; }
+  .edge.depends-on { stroke:#2e86c1; stroke-width:1.7; }
+  .edge.produces { stroke:#27ae60; }
+  .edge.consumed-by { stroke:#e67e22; }
+  .edge.env { stroke:#999; stroke-dasharray:3 3; }
+  .edge.motivated { stroke:#c0392b; stroke-dasharray:3 3; }
+  .edge text { font-size:9px; fill:#888; }
+  .legend { font-size:11px; display:flex; gap:10px; flex-wrap:wrap; }
+  .legend span { display:inline-flex; align-items:center; gap:4px; }
+  .sw { width:12px; height:12px; border-radius:3px; display:inline-block; }
+  #zoomhint { position:absolute; bottom:10px; left:12px; font-size:11px; color:#999; background:#fff; padding:2px 8px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,.15); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Reproducibility graph — __RUN__</h1>
+  <div id="stats"></div>
+  <div id="controls">
+    <input id="search" type="text" placeholder="Search name / path / cmd…">
+    <button id="btn-pipeline" class="active">Pipeline</button>
+    <button id="btn-full">Full</button>
+    <span style="border-left:1px solid #ddd;height:18px"></span>
+    <label><input type="checkbox" id="f-exec" checked> exec</label>
+    <label><input type="checkbox" id="f-art" checked> artifact</label>
+    <label><input type="checkbox" id="f-env"> env</label>
+    <label><input type="checkbox" id="f-dec"> decision</label>
+    <span style="border-left:1px solid #ddd;height:18px"></span>
+    <label><input type="checkbox" id="f-fail"> failures only</label>
+  </div>
+  <div id="crumbs"></div>
+</header>
+<div id="detail"></div>
+<div id="graphwrap">
+  <svg id="graph" viewBox="0 0 1000 600" preserveAspectRatio="xMidYMid meet"></svg>
+  <div id="zoomhint">drag to pan · scroll to zoom · click node → detail · click again → focus</div>
 </div>
-{svg}
-<p style="font-size:11px;color:#666">Hover a node for sha256 / exit code / command. Edge labels: produces / consumed-by / env / depends-on.</p>
-</body></html>"""
+<script id="graph-data" type="application/json">__DATA__</script>
+<script>
+(function(){
+"use strict";
+var DATA = JSON.parse(document.getElementById('graph-data').textContent);
+var svg = document.getElementById('graph');
+var NS = 'http://www.w3.org/2000/svg';
+var COL = { run:'#9b59b6', execution:'#2e86c1', artifact:'#27ae60', environment:'#e67e22', decision:'#c0392b' };
+var FILL = { run:'#f9f0ff', execution:'#e6f2ff', artifact:'#e6ffe6', environment:'#fff7e6', decision:'#ffe6e6' };
+var byId = {}; DATA.nodes.forEach(function(n){ byId[n.id] = n; });
+var execs = DATA.nodes.filter(function(n){ return n.kind==='execution'; });
+var artifacts = DATA.nodes.filter(function(n){ return n.kind==='artifact'; });
+var envs = DATA.nodes.filter(function(n){ return n.kind==='environment'; });
+var decs = DATA.nodes.filter(function(n){ return n.kind==='decision'; });
+var edges = DATA.edges;
+var state = { mode:'pipeline', focus:null, show:{execution:true, artifact:true, environment:false, decision:false}, failOnly:false, search:'', vb:{x:0,y:0,w:1000,h:600} };
+
+function base(p){ return p ? String(p).split('/').pop() : ''; }
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+document.getElementById('stats').textContent =
+  execs.length + ' executions · ' + artifacts.length + ' artifacts · ' + envs.length + ' env · ' + decs.length + ' decisions';
+
+// ---------- visible set ----------
+function visible(){
+  var show = {};
+  DATA.nodes.forEach(function(n){
+    if(!state.show[n.kind]) return;
+    if(state.failOnly && n.kind==='execution' && n.exit_code===0) return;
+    if(state.search){
+      var hay = (n.label + ' ' + (n.cmd||'') + ' ' + (n.path||'')).toLowerCase();
+      if(hay.indexOf(state.search) < 0) return;
+    }
+    show[n.id] = true;
+  });
+  return show;
+}
+
+// ---------- layout ----------
+function longestPath(nodes, es){
+  var preds = {}; nodes.forEach(function(n){ preds[n]=[]; });
+  es.forEach(function(e){ preds[e.d].push(e.s); });
+  var lvl = {}; nodes.forEach(function(n){ lvl[n]=0; });
+  var changed = true;
+  while(changed){ changed=false;
+    nodes.forEach(function(n){ preds[n].forEach(function(p){ if(lvl[p]+1>lvl[n]){ lvl[n]=lvl[p]+1; changed=true; } }); });
+  }
+  return lvl;
+}
+function layout(nodes, es){
+  var lvl = longestPath(nodes, es);
+  var layers = {};
+  nodes.forEach(function(n){ (layers[lvl[n]] = layers[lvl[n]]||[]).push(n); });
+  var W=190, H=64, GX=70, GY=26, pos={}, maxY=0;
+  Object.keys(layers).sort(function(a,b){return a-b;}).forEach(function(l){
+    layers[l].forEach(function(n,i){
+      pos[n] = {x:+l*(W+GX)+20, y:i*(H+GY)+20, w:W, h:H};
+      if(i*(H+GY)+20+H > maxY) maxY=i*(H+GY)+20+H;
+    });
+  });
+  return {pos:pos, maxX:Object.keys(layers).length*(W+GX)+20, maxY:maxY};
+}
+function egoLayout(focusId){
+  var preds = edges.filter(function(e){ return e.dst===focusId && e.rel!=='contains'; });
+  var succs = edges.filter(function(e){ return e.src===focusId && e.rel!=='contains'; });
+  var W=190, H=64, GY=26, pos={};
+  function place(list, dx){ list.forEach(function(e,i){ var nid = e.src===focusId ? e.dst : e.src; pos[nid]={x:dx, y:i*(H+GY)+20, w:W, h:H}; }); }
+  place(preds, 20);
+  pos[focusId] = {x:20+W+70, y:0, w:W, h:H};
+  place(succs, 20+2*(W+70));
+  return {pos:pos, maxX:20+3*(W+70), maxY:Math.max(preds.length,succs.length)*(H+GY)+20+H};
+}
+
+// ---------- rendering ----------
+function render(){
+  var show = visible();
+  var nodes, es, lr;
+  if(state.mode==='focus' && state.focus && show[state.focus]){
+    var fid = state.focus, neigh = {}; neigh[fid]=1;
+    edges.forEach(function(e){ if(e.src===fid||e.dst===fid){ neigh[e.src]=1; neigh[e.dst]=1; } });
+    nodes = DATA.nodes.filter(function(n){ return neigh[n.id] && show[n.id]; });
+    es = edges.filter(function(e){ return neigh[e.src] && neigh[e.dst] && show[e.src] && show[e.dst]; });
+    lr = egoLayout(fid);
+  } else if(state.mode==='pipeline'){
+    nodes = execs.filter(function(n){ return show[n.id]; });
+    es = edges.filter(function(e){ return e.rel==='depends-on' && show[e.src] && show[e.dst]; });
+    lr = layout(nodes.map(function(n){return n.id;}), es.map(function(e){return {s:e.src,d:e.dst};}));
+  } else {
+    nodes = DATA.nodes.filter(function(n){ return show[n.id]; });
+    es = edges.filter(function(e){ return e.rel!=='contains' && show[e.src] && show[e.dst]; });
+    lr = layout(nodes.map(function(n){return n.id;}), es.map(function(e){return {s:e.src,d:e.dst};}));
+  }
+  var pad = 40;
+  // Start at a readable window: small graphs fit-all, large graphs land zoomed-in (pan to explore).
+  state.vb = {x:0, y:0, w:Math.min(lr.maxX+pad*2, 1500), h:Math.max(lr.maxY+pad*2, 650)};
+  svg.setAttribute('viewBox', '0 0 ' + state.vb.w + ' ' + state.vb.h);
+  svg.innerHTML = '<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#888"/></marker></defs><g id="edges"></g><g id="nodes"></g>';
+  var gE = document.getElementById('edges');
+  es.forEach(function(e){
+    var p1 = lr.pos[e.src], p2 = lr.pos[e.dst];
+    if(!p1 || !p2) return;
+    var x1=p1.x+p1.w, y1=p1.y+p1.h/2, x2=p2.x, y2=p2.y+p2.h/2, mx=(x1+x2)/2;
+    var path = document.createElementNS(NS,'path');
+    path.setAttribute('d', 'M'+x1+','+y1+' C'+mx+','+y1+' '+mx+','+y2+' '+x2+','+y2);
+    path.setAttribute('class', 'edge ' + e.rel);
+    path.setAttribute('marker-end', 'url(#arrow)');
+    gE.appendChild(path);
+    var t = document.createElementNS(NS,'text');
+    t.setAttribute('x', mx); t.setAttribute('y', (y1+y2)/2 - 5); t.setAttribute('text-anchor','middle');
+    t.textContent = e.rel;
+    gE.appendChild(t);
+  });
+  var gN = document.getElementById('nodes');
+  nodes.forEach(function(n){
+    var p = lr.pos[n.id]; if(!p) return;
+    var g = document.createElementNS(NS,'g');
+    g.setAttribute('class','node'); g.setAttribute('data-id', n.id);
+    var r = document.createElementNS(NS,'rect');
+    r.setAttribute('x',p.x); r.setAttribute('y',p.y); r.setAttribute('width',p.w); r.setAttribute('height',p.h); r.setAttribute('rx',8);
+    r.setAttribute('fill', FILL[n.kind]); r.setAttribute('stroke', COL[n.kind]);
+    if(n.kind==='execution' && n.exit_code!==0 && n.exit_code!==null && n.exit_code!==undefined){ r.setAttribute('stroke','#c0392b'); r.setAttribute('stroke-width',2.5); }
+    g.appendChild(r);
+    var t1 = document.createElementNS(NS,'text');
+    t1.setAttribute('x',p.x+8); t1.setAttribute('y',p.y+18); t1.setAttribute('class','t');
+    t1.textContent = n.kind==='artifact' ? base(n.label) : n.label;
+    g.appendChild(t1);
+    var t2 = document.createElementNS(NS,'text');
+    t2.setAttribute('x',p.x+8); t2.setAttribute('y',p.y+34); t2.setAttribute('class','s');
+    if(n.kind==='execution') t2.textContent = 'exit=' + (n.exit_code===null||n.exit_code===undefined?'?':n.exit_code) + ' [' + (n.label_e||'?') + ']';
+    else if(n.kind==='artifact') t2.textContent = (n.sha256||'').slice(0,12);
+    else if(n.kind==='environment') t2.textContent = 'conf=' + (n.confidence||'-') + (n.error?' ERROR':'');
+    else if(n.kind==='decision') t2.textContent = 'conf=' + (n.confidence||'-');
+    g.appendChild(t2);
+    var title = document.createElementNS(NS,'title');
+    title.textContent = detailText(n);
+    g.appendChild(title);
+    gN.appendChild(g);
+  });
+  updateCrumbs();
+}
+function detailText(n){
+  var L = [n.label];
+  if(n.cmd) L.push('cmd: ' + n.cmd);
+  if(n.path) L.push('path: ' + n.path);
+  if(n.sha256) L.push('sha256: ' + n.sha256);
+  if(n.exit_code!==null && n.exit_code!==undefined) L.push('exit: ' + n.exit_code);
+  if(n.label_e) L.push('evidence: ' + n.label_e);
+  if(n.env) L.push('env: ' + n.env);
+  if(n.seed) L.push('seed: ' + n.seed);
+  if(n.confidence) L.push('confidence: ' + n.confidence);
+  if(n.error) L.push('error: ' + n.error);
+  if(n.choice) L.push('choice: ' + n.choice);
+  if(n.reason) L.push('reason: ' + n.reason);
+  return L.join('\n');
+}
+function row(k,v){ return (v===undefined||v===null||v==='') ? '' : '<tr><td>'+esc(k)+'</td><td>'+esc(String(v))+'</td></tr>'; }
+function showDetail(n){
+  var d = document.getElementById('detail');
+  if(!n){ d.style.display='none'; return; }
+  d.innerHTML = '<h3>'+esc(n.label)+'</h3><table>'
+    + row('kind',n.kind) + row('cmd',n.cmd) + row('path',n.path) + row('sha256',n.sha256)
+    + row('exit',n.exit_code) + row('evidence',n.label_e) + row('env',n.env) + row('seed',n.seed)
+    + row('confidence',n.confidence) + row('choice',n.choice) + row('reason',n.reason) + row('error',n.error)
+    + '</table>';
+  d.style.display='block';
+}
+function updateCrumbs(){
+  var c = document.getElementById('crumbs');
+  if(state.focus && byId[state.focus]){
+    c.innerHTML = 'focus: <button data-crumb="root">' + esc(byId[state.focus].label) + '</button> <button data-crumb="up">← up</button>';
+  } else c.innerHTML = '';
+}
+
+// ---------- events ----------
+svg.addEventListener('click', function(e){
+  var g = e.target.closest ? e.target.closest('.node') : null;
+  if(!g) return;
+  var n = byId[g.getAttribute('data-id')]; if(!n) return;
+  showDetail(n);
+  if(state.mode !== 'focus'){ state.focus = n.id; state.mode='focus'; render(); }
+});
+document.addEventListener('click', function(e){
+  var cr = e.target.closest ? e.target.closest('[data-crumb]') : null;
+  if(!cr) return;
+  if(cr.getAttribute('data-crumb')==='up'){ state.focus = null; state.mode='pipeline'; }
+  else { state.focus = null; state.mode='pipeline'; }
+  render();
+});
+var panning=false, lastX=0, lastY=0;
+svg.addEventListener('mousedown', function(e){ panning=true; lastX=e.clientX; lastY=e.clientY; svg.classList.add('panning'); });
+window.addEventListener('mousemove', function(e){
+  if(!panning) return;
+  var dx=e.clientX-lastX, dy=e.clientY-lastY; lastX=e.clientX; lastY=e.clientY;
+  var scale = state.vb.w / svg.clientWidth;
+  state.vb.x -= dx*scale; state.vb.y -= dy*scale;
+  svg.setAttribute('viewBox', state.vb.x + ' ' + state.vb.y + ' ' + state.vb.w + ' ' + state.vb.h);
+});
+window.addEventListener('mouseup', function(){ panning=false; svg.classList.remove('panning'); });
+svg.addEventListener('wheel', function(e){
+  e.preventDefault();
+  var rect = svg.getBoundingClientRect();
+  var px = e.clientX-rect.left, py = e.clientY-rect.top;
+  var scale = state.vb.w / svg.clientWidth;
+  var mx = state.vb.x + px*scale, my = state.vb.y + py*scale;
+  var f = e.deltaY < 0 ? 0.85 : 1.18;
+  state.vb.w *= f; state.vb.h *= f;
+  state.vb.x = mx - (px * state.vb.w / svg.clientWidth);
+  state.vb.y = my - (py * state.vb.h / svg.clientHeight);
+  svg.setAttribute('viewBox', state.vb.x + ' ' + state.vb.y + ' ' + state.vb.w + ' ' + state.vb.h);
+}, {passive:false});
+function bind(id, fn){ document.getElementById(id).addEventListener('change', fn); }
+bind('f-exec', function(e){ state.show.execution=e.target.checked; render(); });
+bind('f-art', function(e){ state.show.artifact=e.target.checked; render(); });
+bind('f-env', function(e){ state.show.environment=e.target.checked; render(); });
+bind('f-dec', function(e){ state.show.decision=e.target.checked; render(); });
+bind('f-fail', function(e){ state.failOnly=e.target.checked; render(); });
+document.getElementById('btn-pipeline').addEventListener('click', function(){ state.mode='pipeline'; state.focus=null; document.getElementById('btn-pipeline').classList.add('active'); document.getElementById('btn-full').classList.remove('active'); render(); });
+document.getElementById('btn-full').addEventListener('click', function(){ state.mode='full'; state.focus=null; document.getElementById('btn-full').classList.add('active'); document.getElementById('btn-pipeline').classList.remove('active'); render(); });
+document.getElementById('search').addEventListener('input', function(e){ state.search=e.target.value.trim().toLowerCase(); render(); });
+render();
+})();
+</script>
+</body>
+</html>'''
 
 
 def cmd_graph(args: argparse.Namespace) -> int:

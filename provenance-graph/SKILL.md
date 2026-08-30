@@ -34,11 +34,24 @@ Edges: `contains` (run→exec), `produces` (exec→output), `consumed-by` (input
 |-------|----------|------|
 | `mermaid` | paper appendix, README, GitHub | markdown-renderable, zero deps — **default** |
 | `dot` | publication figure | render with graphviz → SVG/PNG (e.g. `dot -Tsvg graph.dot > graph.svg`) |
-| `html` | reviewers, debugging | one self-contained file, any browser, hover tooltips |
+| `html` | reviewers, debugging | one self-contained file, any browser — **interactive viewer** (see below) |
 | `ascii` | terminal over SSH | quick check alongside `verify`/`check` |
 | `json` | heavy exploration | canonical export for networkx / Cytoscape / Gephi / neo4j |
 
 Record the format choice as a `decision` event (consistent with the LLM-decides architecture): paper appendix → mermaid (+dot for the figure); debugging → html; quick check → ascii.
+
+## The interactive HTML viewer (designed for scale)
+
+The HTML is a **data/view split**: the graph is embedded as JSON, and a small vanilla-JS viewer renders it client-side. It is built for large analyses — you never stare at the whole graph, you *navigate* it.
+
+- **View modes** — `Pipeline` (executions + `depends-on` edges only: the readable core), `Full` (everything), and **Focus** (click any node → its 1-hop ego graph: what it consumed, what it produced).
+- **Pan/zoom** — drag to pan, scroll to zoom (zoom centered on cursor).
+- **Search** — type-ahead filter over name/path/cmd; matching nodes render, others hide.
+- **Filters** — toggle execution/artifact/env/decision node types; **failures only** (executions with non-zero exit).
+- **Detail panel** — click a node → side panel with full metadata (sha256, command, env, seed, exit, evidence label, timestamps).
+- **Readability** — artifact labels are basenames (full path on hover/detail); failed executions get a red border; env/decision nodes hidden by default (they're annotations, not pipeline).
+- **Readable default zoom** — small graphs fit-all; large graphs land zoomed-in on a window (pan to explore) instead of a hairball.
+- **Scale** — verified with a 200-execution / 400-artifact run: pipeline view renders in ~0.1s, DOM ~300KB, and focus-mode keeps any single view small.
 
 ## Rules
 
