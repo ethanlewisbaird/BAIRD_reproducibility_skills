@@ -37,6 +37,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -624,6 +625,137 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0 if verdict == "PROVENANCE_COMPLETE" else 1
 
 
+# --------------------------------------------------------------------------- check
+# provenance-check: a discipline linter over a run's manifest + event log.
+# FAIL = procedure violation (mislabeled exec, secret recorded, missing init).
+# WARN = honest gap or unaddressed risk (no env capture, reproduction differs).
+# Verdicts: PROVENANCE_CHECK_PASS / PROVENANCE_CHECK_FAIL.
+
+SECRET_PATTERNS = [
+    r"(?i)\b(api[_-]?key|apikey|password|passwd|client[_-]?secret|secret|access[_-]?token|auth[_-]?token|bearer|authorization)\b\s*[:=]\s*[\"']?[^\s\"']{6,}",
+    r"\b(gho_|ghp_|github_pat_|sk-[A-Za-z0-9]{20,}|xox[baprs]-|AKIA[0-9A-Z]{16})\b",
+]
+
+
+def scan_secrets(text: str) -> list[str]:
+    """Return matched secret-shaped strings (truncated), deduplicated."""
+    hits: set[str] = set()
+    for pat in SECRET_PATTERNS:
+        for m in re.finditer(pat, text):
+            hits.add(m.group(0)[:48])
+    return sorted(hits)
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    run_dir = _run_dir(args.run)
+    manifest = load_manifest(run_dir)
+    events = load_events(run_dir)
+    checks: list[dict] = []
+
+    def add(severity: str, check: str, ok: bool, detail: str = "") -> None:
+        checks.append({"level": "OK" if ok else severity,
+                       "check": check, "ok": ok, "detail": detail})
+
+    # --- lifecycle ---
+    has_start = any(e.get("event") == "run_started" for e in events)
+    add("FAIL", "init: run_started event present", has_start,
+        "no run_started event — was provenance-init called?" if not has_start else "")
+
+    # --- git ---
+    git = manifest.get("git")
+    add("WARN", "git state captured", bool(git),
+        "not a git repository" if not git else f"commit {str(git.get('commit',''))[:8]}")
+
+    # --- environment ---
+    caps = manifest.get("environment", {}).get("captures", [])
+    have_cap = any("sha256" in c for c in caps)
+    add("WARN", "environment captured (or honest error)", have_cap,
+        f"{len(caps)} captures recorded" if caps else "no captures recorded")
+
+    # --- executions ---
+    execs = manifest.get("executions", [])
+    unlabeled = [e["execution_id"] for e in execs
+                 if e.get("evidence_label") not in EVIDENCE_LABELS]
+    add("FAIL", "all executions have valid evidence labels", not unlabeled,
+        "unlabeled: " + ", ".join(unlabeled) if unlabeled else "")
+
+    nocmd = [e["execution_id"] for e in execs
+             if not str(e.get("command") or "").strip()]
+    add("FAIL", "all executions have a recorded command", not nocmd,
+        "missing command: " + ", ".join(nocmd) if nocmd else "")
+
+    unhashed_out = sorted({e["execution_id"] for e in execs
+                           for o in e.get("outputs", []) if "sha256" not in o})
+    add("WARN", "all outputs hashed", not unhashed_out,
+        "unhashed outputs in: " + ", ".join(unhashed_out) if unhashed_out else "")
+
+    unhashed_in = sorted({e["execution_id"] for e in execs
+                          for i in e.get("inputs", []) if "sha256" not in i})
+    add("WARN", "all inputs hashed", not unhashed_in,
+        "unhashed inputs in: " + ", ".join(unhashed_in) if unhashed_in else "")
+
+    weak = [e["execution_id"] for e in execs
+            if e.get("evidence_label") in ("adopted", "inferred")
+            and not (e.get("notes") or e.get("decision_id"))]
+    add("WARN", "adopted/inferred executions documented", not weak,
+        "undocumented weak evidence: " + ", ".join(weak) if weak else "")
+
+    # --- secrets (manifest + events + captured stdout/stderr logs) ---
+    blob = json.dumps(manifest, sort_keys=True)
+    for e in events:
+        blob += "\n" + json.dumps(e, sort_keys=True)
+    for rec in execs:
+        for logf in ("stdout_log", "stderr_log"):
+            fp = os.path.join(run_dir, str(rec.get(logf, "")))
+            if os.path.exists(fp):
+                with open(fp, encoding="utf-8", errors="replace") as f:
+                    blob += f.read(1 << 20)
+    hits = scan_secrets(blob)
+    add("FAIL", "no secrets recorded", not hits,
+        "possible secrets: " + ", ".join(hits) if hits else "")
+
+    # --- verify / report discipline ---
+    has_report = os.path.exists(os.path.join(run_dir, "reproducibility_appendix.md"))
+    has_verify = any(str(e.get("event", "")).startswith("verify_") for e in events)
+    add("WARN", "verify recorded before report", (not has_report) or has_verify,
+        "report exists but no verify event recorded" if has_report and not has_verify else "")
+
+    repro = manifest.get("verdicts", {}).get("reproduction")
+    if repro == "REPRODUCTION_DIFFERS":
+        add("WARN", "reproduction differences addressed", False,
+            "re-run differs — mark expected-nondeterministic or investigate")
+    else:
+        add("WARN", "reproduction differences addressed", True,
+            f"verdict: {repro or 'not run'}")
+
+    # --- verdict ---
+    fails = [c for c in checks if c["level"] == "FAIL"]
+    warns = [c for c in checks if c["level"] == "WARN" and not c["ok"]]
+    verdict = "PROVENANCE_CHECK_PASS" if not fails else "PROVENANCE_CHECK_FAIL"
+
+    lines = [f"# Provenance Check — {os.path.basename(run_dir)}", ""]
+    lines.append("| severity | check | status | detail |")
+    lines.append("|----------|-------|--------|--------|")
+    for c in checks:
+        mark = "✔" if c["ok"] else ("⚠" if c["level"] == "WARN" else "✖")
+        lines.append(f"| {c['level']} | {c['check']} | {mark} | {c['detail']} |")
+    lines.append("")
+    lines.append(f"**Verdict**: {verdict} ({len(fails)} fail, {len(warns)} warn)")
+    lines.append("")
+
+    out = os.path.join(run_dir, "provenance_check.md")
+    with open(out, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    append_event(run_dir, {"event": "check_completed", "verdict": verdict,
+                           "fails": len(fails), "warns": len(warns)})
+    manifest.setdefault("verdicts", {})["check"] = verdict
+    save_manifest(run_dir, manifest)
+
+    print("\n".join(lines))
+    return 0 if not fails else 1
+
+
 # --------------------------------------------------------------------------- report
 
 def _figure_map(manifest: dict) -> list[dict]:
@@ -791,6 +923,10 @@ def main(argv: list[str] | None = None) -> int:
     pv.add_argument("--rerun", action="store_true", help="also re-run executions and compare output hashes")
     pv.add_argument("--timeout", type=int, default=600, help="per-execution timeout (s)")
     pv.set_defaults(fn=cmd_verify)
+
+    pck = sub.add_parser("check", help="audit a run for provenance discipline (linter)")
+    pck.add_argument("--run", required=True, help="run id or path")
+    pck.set_defaults(fn=cmd_check)
 
     pr = sub.add_parser("report", help="emit reproducibility appendix")
     pr.add_argument("--run", required=True, help="run id or path")

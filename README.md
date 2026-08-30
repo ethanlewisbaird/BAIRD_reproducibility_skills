@@ -1,8 +1,8 @@
 # Provenance skills for agentic bioinformatics
 
-Five composable agent skills that record, verify, and report scientific provenance for agent-driven bioinformatics work. Designed for pi (Agent Skills standard), but the runtime is a standalone Python script usable by any agent harness or directly from the shell.
+Seven composable agent skills that record, verify, and report scientific provenance for agent-driven bioinformatics work. Designed for pi (Agent Skills standard), but the runtime is a standalone Python script usable by any agent harness or directly from the shell.
 
-## The five skills
+## The seven skills
 
 | skill | lifecycle step | what it does |
 |-------|---------------|--------------|
@@ -11,6 +11,7 @@ Five composable agent skills that record, verify, and report scientific provenan
 | `provenance-exec` | wrap an execution | hash inputs → run command (stdout/stderr to logs) → hash outputs → record exit code, env, seed, evidence label |
 | `provenance-adopt` | integrate non-agentic work | record human/GUI/slurm work after the fact with `adopted`/`inferred` labels |
 | `provenance-verify` | check it | integrity check (artifacts still match hashes) + optional `--rerun` (re-run and compare output hashes) |
+| `provenance-check` | audit discipline | linter: evidence labels, secret hygiene, hashing, env capture, reproduction handling |
 | `provenance-report` | explain it | emit a Markdown reproducibility appendix: figure → script → env → data → seed map, decisions, verdicts |
 
 ## Architecture: LLM decides, runtime executes
@@ -70,7 +71,10 @@ provenance.py exec --run <run> --name "hand-made figure" --cmd "..." --evidence-
 # 5. verify (before submission) — this is the smoke test
 provenance.py verify --run <run> --rerun
 
-# 6. report the appendix
+# 6. audit discipline (linter) — catches secrets, mislabels, gaps
+provenance.py check --run <run>
+
+# 7. report the appendix
 provenance.py report --run <run>
 ```
 
