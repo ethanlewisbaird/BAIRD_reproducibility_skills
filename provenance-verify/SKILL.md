@@ -1,60 +1,53 @@
 ---
 name: provenance-verify
-description: Verify a provenance run — check that every recorded artifact still exists and matches its SHA-256 hash (integrity), and optionally re-run recorded executions to compare output hashes (reproduction). Use before submission, when results seem to have drifted, or after a slurm job completes. Produces PROVENANCE_COMPLETE / PROVENANCE_INCOMPLETE and REPRODUCTION_VERIFIED / REPRODUCTION_DIFFERS verdicts.
+description: Verify a provenance run's integrity (all captured inputs/outputs still present with matching SHA-256 hashes) and optionally its reproduction (re-run every execution and compare exit codes + output hashes). Produces verdicts: PROVENANCE_COMPLETE/INCOMPLETE and REPRODUCTION_VERIFIED / VERIFIED_WITH_CAVEAT / REPRODUCTION_DIFFERS. Use to validate a run before reporting, or as a smoke test that outputs reproduce.
 ---
 
 # provenance-verify
 
-Checks that a run's recorded provenance still holds. This is the "is it reproducible?" step — the one that turns a log into a guarantee.
-
-## When to use
-
-- Before paper submission / sharing results.
-- When results seem to have drifted (a figure changed, a dataset was edited).
-- After a slurm job completes (to verify the outputs actually match what was recorded at submission time).
-- As part of Tier-0 smoke testing: run `--rerun` on a subsample to confirm scripts still execute.
-
-## Runtime
-
-`../lib/provenance.py` (stdlib-only). Copy to the compute host once if working over SSH.
+Checks that captured provenance is (1) trustworthy (integrity) and (2) reproduces (optional re-run). This maps directly onto Tier-0 smoke testing: `verify --rerun` is the smoke test as a provenance operation.
 
 ## Usage
 
 ```bash
-# Integrity check (fast, no re-execution):
+# Integrity only (fast, no re-run)
 python3 provenance.py verify --run run_20260830_142635_c01d7d72
 
-# Full reproduction check (re-runs every recorded command and compares output hashes):
-python3 provenance.py verify --run run_20260830_142635_c01d7d72 --rerun --timeout 600
+# Integrity + reproduction (re-runs every execution!)
+python3 provenance.py verify --run run_20260830_142635_c01d7d72 --rerun [--timeout 300]
 ```
 
-## What it checks
-
-**Integrity** — for every artifact recorded in the manifest:
-- `OK` — file/dir exists and SHA-256 matches.
-- `HASH_MISMATCH` — exists but content changed since recording.
-- `MISSING` — gone.
-
-Also requires git state + at least one env/R record present to be `PROVENANCE_COMPLETE` (an honest verdict: if nothing was captured, provenance is incomplete).
-
-**Reproduction** (`--rerun`) — for each recorded execution:
-- Re-runs the recorded command in its recorded cwd.
-- Compares the re-run exit code and re-hashed outputs against the recorded values.
-- `REPRODUCTION_VERIFIED` — all match. `REPRODUCTION_DIFFERS` — any mismatch or failure.
-
-## Verdicts
+## Integrity verdicts
 
 | verdict | meaning |
 |---------|---------|
-| `PROVENANCE_COMPLETE` | all artifacts intact + git/env records present |
-| `PROVENANCE_INCOMPLETE` | something missing, changed, or never captured |
-| `REPRODUCTION_VERIFIED` | re-run produced identical output hashes |
-| `REPRODUCTION_DIFFERS` | re-run differed (non-deterministic code, drift, or broken script) |
+| `PROVENANCE_COMPLETE` | every recorded input/output exists and its current SHA-256 matches the recorded hash |
+| `PROVENANCE_INCOMPLETE` | something is missing or its hash changed |
 
-`REPRODUCTION_DIFFERS` is not necessarily a bug — it flags non-determinism (e.g. unseeded UMAP coordinates) that you should document. Distinguish "provenance complete" (records exist) from "reproduction verified" (re-run matches) — they are different claims.
+**PROVENANCE_INCOMPLETE does not mean the science is wrong** — it means the captured state has drifted (a file was moved/edited, an env changed, a dependency updated). It's a signal to re-capture or investigate, not a scientific verdict.
+
+## Reproduction verdicts (with --rerun)
+
+Each execution is re-run; a match = (exit code matches recorded) AND (output hashes match). Labels are shown per execution: `observed`, `adopted`, `inferred`.
+
+| verdict | meaning |
+|---------|---------|
+| `REPRODUCTION_VERIFIED` | all reruns matched recorded exit codes + output hashes |
+| `VERIFIED_WITH_CAVEAT` | all matched, but at least one execution was `expected_nondeterministic` (e.g. unseeded UMAP) — outputs may shift on re-run BY DESIGN |
+| `REPRODUCTION_DIFFERS` | at least one execution's rerun did not match |
+
+**Adopted/inferred executions with unknown recorded exit codes** are treated as matching if their outputs match (re-run success is the strongest signal we have) — but the label makes it visible that this was post-hoc evidence, not observed.
+
+## Tier-0 smoke testing (verify --rerun as the smoke test)
+
+This is the recommended way to smoke-test a pipeline:
+1. `provenance-exec` each script with the **real** (or representative) inputs.
+2. `verify --rerun` — executes every script again in order, hashes outputs, and reports which reproduce.
+3. A `REPRODUCTION_DIFFERS` result with a matching run log tells you *which* script diverged and how — exactly what a smoke test needs.
 
 ## Rules
 
-- Verdicts are written to the manifest and event log — they become part of the record.
-- Exit code is 0 only if integrity is `PROVENANCE_COMPLETE`; a `--rerun` mismatch does not change the exit code (it's recorded, not fatal).
-- For large/slow pipelines, prefer `verify` (integrity) on the full run and `--rerun` on a subsample or a single execution.
+- `--rerun` re-executes **every** recorded command — it can be expensive (GPU jobs, long analyses). Use a short `--timeout` caution and a subsample for smoke tests.
+- `--rerun` re-runs in the **current** env, not the recorded env — a `DIFFERS` may be an env drift, not a real reproducibility failure. Pair with `provenance-capture` to diagnose.
+- Integrity drift (`PROVENANCE_INCOMPLETE`) is distinct from reproduction failure — report them separately; don't conflate "file moved" with "script broken".
+- Never modify the provenance log during verify; verification is read-only except for rerun's own logs (written to the run dir as verify artifacts).

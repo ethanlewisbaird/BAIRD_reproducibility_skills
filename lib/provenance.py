@@ -1,26 +1,34 @@
 #!/usr/bin/env python3
-"""provenance.py — deterministic provenance runtime for agentic bioinformatics.
+"""provenance.py — deterministic execution layer for agentic bioinformatics provenance.
 
 Self-contained (Python 3 stdlib only, zero dependencies). Works locally or over SSH.
 
-Subcommands:
-  init     Start a run: create results/run_<ts>_<id>/, capture git state, env exports, R sessionInfo.
-  exec     Wrap one execution: hash inputs, run command, hash outputs, record metadata + logs.
-  verify   Check recorded artifacts still exist and match hashes; optionally re-run and compare.
-  report   Emit a Markdown reproducibility appendix (figure -> script -> env -> data -> seed).
+ARCHITECTURE — LLM decides, runtime executes:
+  The LLM (pi agent + skills) is the DECISION layer: it detects the environment, decides
+  what to capture, and authors CAPTURE PLANS + DECISION events. This runtime is the
+  EXECUTION layer: it executes plans deterministically (hash / capture / record / verify /
+  report). The LLM never computes hashes or writes JSON itself; it authors the plan and
+  the runtime enforces it. Decisions are recorded as first-class provenance events so the
+  edge-case handling is itself auditable.
+
+Evidence labels (per execution):
+  OBSERVED   — agent wrapped the execution (strongest)
+  ADOPTED    — recorded after the fact; exit_code may be unknown (medium)
+  INFERRED   — lineage asserted by a human, not observed (weakest)
 
 Verdicts:
-  PROVENANCE_COMPLETE     all recorded artifacts intact + git/env records present
-  PROVENANCE_INCOMPLETE   something missing or hash mismatch
-  REPRODUCTION_VERIFIED   re-run produced identical output hashes
-  REPRODUCTION_DIFFERS    re-run produced different output hashes (or failed)
+  PROVENANCE_COMPLETE / PROVENANCE_INCOMPLETE   integrity of recorded artifacts
+  REPRODUCTION_VERIFIED / REPRODUCTION_DIFFERS  re-run matched / differed
+  VERIFIED_WITH_CAVEAT                          expected-nondeterministic exec matched
 
-Design rules (from design review):
+Design rules:
   - Path = location, SHA-256 = identity. Never trust paths alone.
   - The provenance graph is the index; large artifacts stay in place on disk.
-  - The event log (provenance.jsonl) is append-only source of truth; manifest.json is a materialized summary.
+  - The event log (provenance.jsonl) is append-only source of truth; manifest.json is a
+    materialized summary.
   - Failed runs are recorded, not discarded.
   - Secrets are never recorded.
+  - Full SHA-256 always (streaming, 1 MiB chunks) — no fast mode for large files.
 """
 from __future__ import annotations
 
@@ -34,10 +42,14 @@ import subprocess
 import sys
 import time
 
-SCHEMA = "baird-provenance/v1"
+SCHEMA = "baird-provenance/v2"
 CHUNK = 1 << 20  # 1 MiB
 RESULTS_DIR = "results"
 RUN_DIR_FMT = "run_%Y%m%d_%H%M%S"
+
+# Confidence levels for capture methods.
+CONFIDENCE = ("high", "medium", "low")
+EVIDENCE_LABELS = ("observed", "adopted", "inferred")
 
 
 def now_iso() -> str:
@@ -161,7 +173,160 @@ def run_cmd(cmd: str, timeout: int = 600, cwd: str | None = None) -> tuple[int, 
         return -1, "", str(e)
 
 
-# --------------------------------------------------------------------------- captures
+# --------------------------------------------------------------------------- capture methods
+# Each method: identifier -> (name, confidence, capture_fn(out_dir, kwargs) -> record dict)
+# The registry is OPEN: the LLM composes these primitives for new edge cases and records a
+# DECISION event explaining the choice. Confidence labels the evidence strength.
+
+_CAPTURE_METHODS: dict[str, dict] = {}
+
+
+def register_capture(method: str, name: str, confidence: str, fn) -> None:
+    _CAPTURE_METHODS[method] = {"name": name, "confidence": confidence, "fn": fn}
+
+
+def _cap_git(out_dir: str, kwargs: dict) -> dict:
+    cwd = kwargs.get("project") or kwargs.get("cwd") or os.getcwd()
+    g = git_state(cwd)
+    if not g:
+        return {"method": "git", "error": "not a git repository"}
+    return {"method": "git", **g}
+
+
+def _cap_conda(out_dir: str, kwargs: dict) -> dict:
+    env_name = kwargs.get("env") or kwargs.get("name")
+    if not env_name:
+        return {"method": "conda", "error": "missing env name"}
+    out = os.path.join(out_dir, f"env_{env_name}.yml")
+    for mgr in ("conda", "mamba", "micromamba"):
+        rc, stdout, _ = run_cmd(f"{mgr} env export -n {env_name} 2>/dev/null", timeout=300)
+        if rc == 0 and stdout.strip():
+            with open(out, "w") as f:
+                f.write(stdout)
+            return {"method": "conda", "name": env_name, "manager": mgr,
+                    "file": os.path.basename(out), "sha256": sha256_file(out)}
+    return {"method": "conda", "name": env_name, "error": "conda/mamba/micromamba env export failed"}
+
+
+def _cap_pixi(out_dir: str, kwargs: dict) -> dict:
+    cwd = kwargs.get("cwd") or os.getcwd()
+    # Best pin: copy the lockfile verbatim.
+    for lock in ("pixi.lock", "pixi.toml"):
+        p = os.path.join(cwd, lock)
+        if os.path.exists(p):
+            dest = os.path.join(out_dir, lock)
+            with open(p, "rb") as fi, open(dest, "wb") as fo:
+                fo.write(fi.read())
+            return {"method": "pixi", "file": lock, "sha256": sha256_file(dest)}
+    rc, stdout, _ = run_cmd("pixi export 2>/dev/null", timeout=300, cwd=cwd)
+    if rc == 0 and stdout.strip():
+        out = os.path.join(out_dir, "pixi_export.yml")
+        with open(out, "w") as f:
+            f.write(stdout)
+        return {"method": "pixi", "file": "pixi_export.yml", "sha256": sha256_file(out)}
+    return {"method": "pixi", "error": "no pixi.lock/pixi.toml and pixi export failed"}
+
+
+def _cap_docker(out_dir: str, kwargs: dict) -> dict:
+    image = kwargs.get("image")
+    rc, stdout, _ = run_cmd(f"docker image inspect {image} 2>/dev/null", timeout=120)
+    if rc != 0 or not stdout.strip():
+        return {"method": "docker", "image": image, "error": "docker image inspect failed"}
+    rec = json.loads(stdout)[0]
+    digest = rec.get("Id", "").replace("sha256:", "")
+    out = os.path.join(out_dir, f"docker_{image.replace('/', '_').replace(':', '_')}.json")
+    with open(out, "w") as f:
+        json.dump({"Id": rec.get("Id"), "RepoTags": rec.get("RepoTags"),
+                   "Architecture": rec.get("Architecture"), "Os": rec.get("Os"),
+                   "Created": rec.get("Created")}, f, indent=2)
+    return {"method": "docker", "image": image, "digest": digest,
+            "file": os.path.basename(out), "sha256": sha256_file(out)}
+
+
+def _cap_renv(out_dir: str, kwargs: dict) -> dict:
+    cwd = kwargs.get("cwd") or os.getcwd()
+    lock = os.path.join(cwd, "renv.lock")
+    if not os.path.exists(lock):
+        return {"method": "renv", "error": "no renv.lock"}
+    dest = os.path.join(out_dir, "renv.lock")
+    with open(lock, "rb") as fi, open(dest, "wb") as fo:
+        fo.write(fi.read())
+    return {"method": "renv", "file": "renv.lock", "sha256": sha256_file(dest)}
+
+
+def _cap_pip(out_dir: str, kwargs: dict) -> dict:
+    name = kwargs.get("name") or "pip"
+    out = os.path.join(out_dir, f"pip_freeze_{name}.txt")
+    rc, stdout, _ = run_cmd("pip freeze 2>/dev/null", timeout=300,
+                            cwd=kwargs.get("cwd"))
+    if rc != 0 or not stdout.strip():
+        return {"method": "pip", "error": "pip freeze failed"}
+    with open(out, "w") as f:
+        f.write(stdout)
+    return {"method": "pip", "name": name, "file": os.path.basename(out),
+            "sha256": sha256_file(out)}
+
+
+def _cap_rsession(out_dir: str, kwargs: dict) -> dict:
+    rscript = kwargs.get("rscript") or "Rscript"
+    name = kwargs.get("name") or "R"
+    out = os.path.join(out_dir, f"sessionInfo_{name.replace(' ', '_')}.txt")
+    rc, stdout, _ = run_cmd(f"{rscript} -e 'sessionInfo()' 2>/dev/null", timeout=300)
+    if rc != 0 or not stdout.strip():
+        return {"method": "rsession", "error": "R sessionInfo capture failed"}
+    with open(out, "w") as f:
+        f.write(stdout)
+    return {"method": "rsession", "name": name, "file": os.path.basename(out),
+            "sha256": sha256_file(out)}
+
+
+def _cap_sacct(out_dir: str, kwargs: dict) -> dict:
+    jobid = kwargs.get("job_id")
+    if not jobid:
+        return {"method": "sacct", "error": "missing job_id"}
+    rc, stdout, _ = run_cmd(f"sacct -j {jobid} --format=JobID,State,ExitCode "
+                            "--noheader 2>/dev/null", timeout=60)
+    if rc != 0 or not stdout.strip():
+        return {"method": "sacct", "job_id": jobid, "error": "sacct query failed"}
+    with open(os.path.join(out_dir, f"sacct_{jobid}.txt"), "w") as f:
+        f.write(stdout)
+    return {"method": "sacct", "job_id": jobid, "state": stdout.strip().splitlines()[-1],
+            "file": f"sacct_{jobid}.txt", "sha256": sha256_file(os.path.join(out_dir, f"sacct_{jobid}.txt"))}
+
+
+def _cap_file(out_dir: str, kwargs: dict) -> dict:
+    """Hash/copy-in a single file or directory (e.g. a lockfile, a downloaded artifact)."""
+    path = kwargs.get("path")
+    if not path or not os.path.exists(path):
+        return {"method": "file", "path": path, "error": "missing at capture time"}
+    ap = os.path.abspath(path)
+    rec = {"method": "file", "path": path, "sha256": sha256_path(ap)}
+    if os.path.isfile(ap):
+        rec["size_bytes"] = os.path.getsize(ap)
+        # Copy small files into the run (for lockfile/script captures); leave big ones in place.
+        if kwargs.get("copy") and os.path.getsize(ap) < 10 * CHUNK:
+            dest = os.path.join(out_dir, os.path.basename(ap))
+            with open(ap, "rb") as fi, open(dest, "wb") as fo:
+                while True:
+                    blk = fi.read(CHUNK)
+                    if not blk:
+                        break
+                    fo.write(blk)
+            rec["file"] = os.path.basename(dest)
+    return rec
+
+
+def register_default_captures() -> None:
+    register_capture("git", "git state", "high", _cap_git)
+    register_capture("conda", "conda/mamba/micromamba env export", "high", _cap_conda)
+    register_capture("pixi", "pixi lockfile / export", "high", _cap_pixi)
+    register_capture("docker", "docker image inspect", "high", _cap_docker)
+    register_capture("renv", "renv.lock", "high", _cap_renv)
+    register_capture("pip", "pip freeze", "medium", _cap_pip)
+    register_capture("rsession", "R sessionInfo", "high", _cap_rsession)
+    register_capture("sacct", "slurm sacct", "high", _cap_sacct)
+    register_capture("file", "file/dir hash + optional copy", "high", _cap_file)
+
 
 def git_state(cwd: str | None = None) -> dict | None:
     """Best-effort git capture: commit, branch, dirty-tree hash (of `git status --porcelain`)."""
@@ -178,31 +343,6 @@ def git_state(cwd: str | None = None) -> dict | None:
         "dirty_tree_hash": dirty_hash,
     }
 
-
-def capture_conda_env(env_name: str, out_dir: str) -> dict:
-    """Best-effort `conda env export` (full pin). Returns record or error."""
-    out = os.path.join(out_dir, f"env_{env_name}.yml")
-    for mgr in ("conda", "micromamba"):
-        rc, stdout, _ = run_cmd(f"{mgr} env export -n {env_name} 2>/dev/null", timeout=300)
-        if rc == 0 and stdout.strip():
-            with open(out, "w") as f:
-                f.write(stdout)
-            return {"name": env_name, "manager": mgr, "file": os.path.basename(out),
-                    "sha256": sha256_file(out)}
-    return {"name": env_name, "error": "conda/micromamba env export failed"}
-
-
-def capture_r_session(rscript: str, out_dir: str) -> dict:
-    out = os.path.join(out_dir, "sessionInfo.txt")
-    rc, stdout, _ = run_cmd(f"{rscript} -e 'sessionInfo()' 2>/dev/null", timeout=300)
-    if rc == 0 and stdout.strip():
-        with open(out, "w") as f:
-            f.write(stdout)
-        return {"rscript": rscript, "file": os.path.basename(out), "sha256": sha256_file(out)}
-    return {"rscript": rscript, "error": "R sessionInfo capture failed"}
-
-
-# --------------------------------------------------------------------------- init
 
 def cmd_init(args: argparse.Namespace) -> int:
     project = os.path.abspath(args.project or os.getcwd())
@@ -223,23 +363,66 @@ def cmd_init(args: argparse.Namespace) -> int:
         "research_question": args.question or "",
         "seed": args.seed,
         "git": git_state(project),
-        "environment": {"conda_envs": [], "r_session": None},
+        "environment": {"captures": []},
         "executions": [],
         "artifacts": {},
         "verdicts": {},
     }
 
-    for env in args.env or []:
-        rec = capture_conda_env(env, os.path.join(run_dir, "environment"))
-        manifest["environment"]["conda_envs"].append(rec)
-
-    if args.rscript:
-        manifest["environment"]["r_session"] = capture_r_session(args.rscript, os.path.join(run_dir, "environment"))
-
     save_manifest(run_dir, manifest)
     append_event(run_dir, {"event": "run_started", "run_id": manifest["run_id"], "seed": args.seed})
 
     print(run_dir)
+    return 0
+
+
+# --------------------------------------------------------------------------- capture command
+
+def cmd_capture(args: argparse.Namespace) -> int:
+    run_dir = _run_dir(args.run)
+    manifest = load_manifest(run_dir)
+    out_dir = os.path.join(run_dir, "environment")
+    os.makedirs(out_dir, exist_ok=True)
+
+    method = args.method
+    info = _CAPTURE_METHODS.get(method)
+    if not info:
+        sys.exit(f"ERROR: unknown capture method '{method}'. Known: {', '.join(sorted(_CAPTURE_METHODS))}")
+
+    kwargs = {}
+    for spec in (args.kwargs or []):
+        k, _, v = spec.partition("=")
+        if k.strip():
+            kwargs[k.strip()] = v
+
+    rec = info["fn"](out_dir, kwargs)
+    rec.setdefault("confidence", info["confidence"])
+    rec.setdefault("recorded_at", now_iso())
+
+    manifest.setdefault("environment", {}).setdefault("captures", []).append(rec)
+    save_manifest(run_dir, manifest)
+    append_event(run_dir, {"event": "capture", "method": method, "rec": rec})
+    print(json.dumps(rec, indent=2))
+    return 0 if "error" not in rec else 1
+
+
+def cmd_record_decision(args: argparse.Namespace) -> int:
+    run_dir = _run_dir(args.run)
+    manifest = load_manifest(run_dir)
+    ev = {
+        "event": "decision",
+        "decision_id": args.id or f"dec_{len(load_events(run_dir)) + 1:03d}",
+        "situation": args.situation,
+        "choice": args.choice,
+        "reason": args.reason,
+        "confidence": args.confidence,
+    }
+    if args.evidence:
+        ev["evidence"] = args.evidence.split(",")
+    if args.hashes:
+        ev["hashes"] = args.hashes.split(",")
+    append_event(run_dir, ev)
+    print(json.dumps(ev, indent=2))
     return 0
 
 
@@ -295,6 +478,13 @@ def cmd_exec(args: argparse.Namespace) -> int:
     rc, stdout, stderr = run_cmd(args.cmd, timeout=args.timeout, cwd=args.cwd)
     duration = round(time.time() - t0, 2)
 
+    # For adopted/inferred execs, the caller may know the exit code without re-running
+    # (e.g. from a slurm log). Override only when explicitly given.
+    if args.exit_code_override is not None:
+        rc = int(args.exit_code_override)
+        stdout = stdout or "(exit code overridden; stdout not captured)"
+        stderr = stderr or "(exit code overridden)"
+
     # Hash outputs AFTER execution so we record the produced files.
     outputs = _hash_path_list(args.outputs)
 
@@ -304,6 +494,10 @@ def cmd_exec(args: argparse.Namespace) -> int:
     with open(log_base + ".stderr.log", "w") as f:
         f.write(stderr or "")
 
+    label = (args.evidence_label or "observed").lower()
+    if label not in EVIDENCE_LABELS:
+        sys.exit(f"ERROR: evidence label must be one of {EVIDENCE_LABELS}, got '{label}'")
+
     rec = {
         "execution_id": exec_id,
         "name": args.name or exec_id,
@@ -311,15 +505,20 @@ def cmd_exec(args: argparse.Namespace) -> int:
         "cwd": os.path.abspath(args.cwd) if args.cwd else os.getcwd(),
         "env": args.env,
         "seed": args.seed,
+        "evidence_label": label,
         "started_at": now_iso(),
         "duration_s": duration,
         "exit_code": rc,
+        "expected_nondeterministic": bool(args.expected_nondeterministic),
         "code": code_ref,
         "inputs": inputs,
         "outputs": outputs,
         "stdout_log": f"logs/{exec_id}.stdout.log",
         "stderr_log": f"logs/{exec_id}.stderr.log",
     }
+    if args.notes:
+        rec["notes"] = args.notes
+
     manifest.setdefault("executions", []).append(rec)
 
     for a in inputs + outputs:
@@ -331,7 +530,6 @@ def cmd_exec(args: argparse.Namespace) -> int:
     save_manifest(run_dir, manifest)
     append_event(run_dir, {"event": "execution_finished", "execution_id": exec_id,
                            "exit_code": rc, "duration_s": duration})
-
     print(json.dumps({"execution_id": exec_id, "exit_code": rc,
                       "outputs": [o.get("sha256") for o in outputs]}, indent=2))
     return 0
@@ -354,8 +552,8 @@ def verify_integrity(manifest: dict) -> tuple[str, list[dict]]:
         else:
             checks.append({"artifact": aid, "path": p, "status": "HASH_MISMATCH"})
             ok = False
-    env_records = manifest.get("environment", {})
-    env_ok = bool(env_records.get("conda_envs")) or bool(env_records.get("r_session"))
+    env_records = manifest.get("environment", {}).get("captures", [])
+    env_ok = any("sha256" in r for r in env_records)
     git_ok = bool(manifest.get("git"))
     verdict = "PROVENANCE_COMPLETE" if (ok and env_ok and git_ok) else "PROVENANCE_INCOMPLETE"
     return verdict, checks
@@ -364,6 +562,7 @@ def verify_integrity(manifest: dict) -> tuple[str, list[dict]]:
 def verify_reproduction(manifest: dict, timeout: int) -> tuple[str, list[dict]]:
     details = []
     all_match = True
+    any_caveat = False
     for rec in manifest.get("executions", []):
         rc, stdout, stderr = run_cmd(rec["command"], timeout=timeout, cwd=rec.get("cwd"))
         out_match = True
@@ -376,13 +575,25 @@ def verify_reproduction(manifest: dict, timeout: int) -> tuple[str, list[dict]]:
             if sha256_path(o["path"]) != o["sha256"]:
                 out_match = False
         match = (rc == rec.get("exit_code")) and out_match
+        # Adopted/inferred runs may have unknown exit codes — treat recorded-unknown as a
+        # match if outputs match (re-run success is the strongest signal we have).
+        if rec.get("evidence_label") in ("adopted", "inferred") and not rec.get("exit_code_known", True):
+            match = out_match
+        if rec.get("expected_nondeterministic"):
+            match = True
+            any_caveat = True
         if not match:
             all_match = False
         details.append({"execution_id": rec["execution_id"], "rerun_exit": rc,
                         "recorded_exit": rec.get("exit_code"), "outputs_match": out_match,
+                        "evidence_label": rec.get("evidence_label", "observed"),
+                        "expected_nondeterministic": rec.get("expected_nondeterministic", False),
                         "match": match})
-    verdict = "REPRODUCTION_VERIFIED" if all_match else "REPRODUCTION_DIFFERS"
-    return verdict, details
+    if not all_match:
+        return "REPRODUCTION_DIFFERS", details
+    if any_caveat:
+        return "VERIFIED_WITH_CAVEAT", details
+    return "REPRODUCTION_VERIFIED", details
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -406,7 +617,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"reproduction: {rv}")
         for d in details:
             print(f"  {d['execution_id']}: rerun_exit={d['rerun_exit']} "
-                  f"recorded_exit={d['recorded_exit']} outputs_match={d['outputs_match']}")
+                  f"recorded_exit={d['recorded_exit']} outputs_match={d['outputs_match']} "
+                  f"label={d.get('evidence_label', 'observed')}")
 
     save_manifest(run_dir, manifest)
     return 0 if verdict == "PROVENANCE_COMPLETE" else 1
@@ -427,6 +639,7 @@ def _figure_map(manifest: dict) -> list[dict]:
                     "script": (rec.get("code") or {}).get("path") or rec.get("command"),
                     "env": rec.get("env"),
                     "seed": rec.get("seed"),
+                    "evidence_label": rec.get("evidence_label", "observed"),
                     "inputs": ", ".join(i.get("path") for i in rec.get("inputs", [])),
                     "exit_code": rec.get("exit_code"),
                 })
@@ -436,6 +649,7 @@ def _figure_map(manifest: dict) -> list[dict]:
 def cmd_report(args: argparse.Namespace) -> int:
     run_dir = _run_dir(args.run)
     manifest = load_manifest(run_dir)
+    events = load_events(run_dir)
     run_id = manifest.get("run_id", os.path.basename(run_dir))
 
     L = []
@@ -460,38 +674,51 @@ def cmd_report(args: argparse.Namespace) -> int:
     L.append("")
 
     L.append("## Environment")
-    env = manifest.get("environment", {})
-    for rec in env.get("conda_envs", []):
-        if "error" in rec:
-            L.append(f"- conda env `{rec['name']}`: {rec['error']}")
-        else:
-            L.append(f"- conda env `{rec['name']}` → `environment/{rec['file']}` (`{rec['sha256'][:16]}…`)")
-    rs = env.get("r_session")
-    if rs:
-        if "error" in rs:
-            L.append(f"- R sessionInfo: {rs['error']}")
-        else:
-            L.append(f"- R sessionInfo → `environment/{rs['file']}` (`{rs['sha256'][:16]}…`)")
+    captures = manifest.get("environment", {}).get("captures", [])
+    if captures:
+        L.append("| method | confidence | detail | sha256 |")
+        L.append("|--------|------------|--------|--------|")
+        for rec in captures:
+            if "error" in rec:
+                L.append(f"| {rec.get('method','?')} | {rec.get('confidence','?')} | "
+                         f"ERROR: {rec['error']} | — |")
+            else:
+                detail = rec.get("file") or rec.get("name") or rec.get("image") or rec.get("job_id") or ""
+                L.append(f"| {rec.get('method','?')} | {rec.get('confidence','?')} | {detail} | "
+                         f"`{rec.get('sha256','')[:16]}…` |")
+    else:
+        L.append("- (no captures recorded)")
     L.append("")
 
     L.append("## Executions")
-    L.append("| exec | exit | env | seed | command | inputs | outputs |")
-    L.append("|------|------|-----|------|---------|--------|---------|")
+    L.append("| exec | label | exit | env | seed | command | inputs | outputs |")
+    L.append("|------|-------|------|-----|------|---------|--------|---------|")
     for rec in manifest.get("executions", []):
         ins = ", ".join(f"`{i['path']}`" for i in rec.get("inputs", [])) or "—"
         outs = ", ".join(f"`{o['path']}`" for o in rec.get("outputs", [])) or "—"
-        L.append(f"| {rec['execution_id']} | {rec['exit_code']} | {rec.get('env') or '—'} | "
+        L.append(f"| {rec['execution_id']} | {rec.get('evidence_label','observed')} | "
+                 f"{rec.get('exit_code','?')} | {rec.get('env') or '—'} | "
                  f"{rec.get('seed') or '—'} | `{rec['command']}` | {ins} | {outs} |")
     L.append("")
 
     figs = _figure_map(manifest)
     if figs:
         L.append("## Figure → Script → Env → Data → Seed")
-        L.append("| figure | script | env | seed | input data |")
-        L.append("|--------|--------|-----|------|------------|")
+        L.append("| figure | script | env | seed | evidence | input data |")
+        L.append("|--------|--------|-----|------|----------|------------|")
         for r in figs:
             L.append(f"| `{r['figure']}` | `{r['script']}` | {r['env'] or '—'} | "
-                     f"{r['seed'] or '—'} | {r['inputs'] or '—'} |")
+                     f"{r['seed'] or '—'} | {r['evidence_label']} | {r['inputs'] or '—'} |")
+        L.append("")
+
+    decisions = [e for e in events if e.get("event") == "decision"]
+    if decisions:
+        L.append("## Decisions (edge-case handling)")
+        L.append("| decision | situation | choice | confidence | reason |")
+        L.append("|----------|-----------|--------|------------|--------|")
+        for d in decisions:
+            L.append(f"| {d.get('decision_id','?')} | {d.get('situation','?')} | "
+                     f"{d.get('choice','?')} | {d.get('confidence','?')} | {d.get('reason','?')} |")
         L.append("")
 
     v = manifest.get("verdicts", {})
@@ -510,16 +737,34 @@ def cmd_report(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- main
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="provenance", description="Provenance runtime for agentic bioinformatics")
+    register_default_captures()
+    p = argparse.ArgumentParser(prog="provenance", description="Provenance execution layer for agentic bioinformatics")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pi = sub.add_parser("init", help="start a run")
     pi.add_argument("--project", default=None, help="project dir (default: cwd)")
     pi.add_argument("--question", default="", help="research question / goal")
     pi.add_argument("--seed", default=None, help="global random seed")
-    pi.add_argument("--env", action="append", help="conda env name to export (repeatable)")
-    pi.add_argument("--rscript", default=None, help="path to Rscript for sessionInfo capture")
     pi.set_defaults(fn=cmd_init)
+
+    pc = sub.add_parser("capture", help="capture environment state via an open method registry")
+    pc.add_argument("--run", required=True, help="run id or path")
+    pc.add_argument("--method", required=True, choices=sorted(_CAPTURE_METHODS),
+                    help=f"known: {', '.join(sorted(_CAPTURE_METHODS))}")
+    pc.add_argument("--kwargs", action="append", default=[],
+                    help="key=value capture kwargs (repeatable), e.g. env=R_process7")
+    pc.set_defaults(fn=cmd_capture)
+
+    pd = sub.add_parser("record-decision", help="record an LLM-authored decision (edge-case handling)")
+    pd.add_argument("--run", required=True)
+    pd.add_argument("--id", default=None, help="decision id (default: auto)")
+    pd.add_argument("--situation", required=True, help="what triggered the decision")
+    pd.add_argument("--choice", required=True, help="what was decided")
+    pd.add_argument("--reason", required=True, help="why")
+    pd.add_argument("--confidence", default="medium", choices=CONFIDENCE)
+    pd.add_argument("--evidence", default=None, help="comma-separated evidence refs")
+    pd.add_argument("--hashes", default=None, help="comma-separated evidence hashes")
+    pd.set_defaults(fn=cmd_record_decision)
 
     pe = sub.add_parser("exec", help="wrap an execution")
     pe.add_argument("--run", required=True, help="run id or path")
@@ -532,6 +777,13 @@ def main(argv: list[str] | None = None) -> int:
     pe.add_argument("--cwd", default=None, help="working dir for the command")
     pe.add_argument("--copy", default=None, help="script path to copy into run's code/ (for unversioned scripts)")
     pe.add_argument("--timeout", type=int, default=600, help="command timeout (s)")
+    pe.add_argument("--evidence-label", default="observed", choices=EVIDENCE_LABELS,
+                    help="observed (agent-wrapped) / adopted (post-hoc) / inferred (asserted)")
+    pe.add_argument("--exit-code-override", type=int, default=None,
+                    help="known exit code for adopted runs (overrides actual run result)")
+    pe.add_argument("--expected-nondeterministic", action="store_true",
+                    help="mark exec as expected-nondeterministic (verify -> VERIFIED_WITH_CAVEAT)")
+    pe.add_argument("--notes", default=None, help="free-text notes")
     pe.set_defaults(fn=cmd_exec)
 
     pv = sub.add_parser("verify", help="verify a run")

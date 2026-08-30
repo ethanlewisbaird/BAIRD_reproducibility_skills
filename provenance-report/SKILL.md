@@ -1,21 +1,11 @@
 ---
 name: provenance-report
-description: Generate a Markdown reproducibility appendix from a provenance run — a figure → script → env → data → seed map, execution table, git state, environment pins, and PROVENANCE_COMPLETE vs REPRODUCTION_VERIFIED verdicts. Use to produce the reproducibility section of a paper, for reviewers, or to audit what produced a given figure.
+description: Generate a Markdown reproducibility appendix from a provenance run — a figure → script → env → data → seed map, execution table with evidence labels (observed/adopted/inferred), environment captures, git state, LLM decisions (edge-case handling), and verdicts. Use to produce the reproducibility section of a paper, for reviewers, or to audit what produced a given figure.
 ---
 
 # provenance-report
 
 Turns a provenance run into a human-readable reproducibility appendix. This is the "show the provenance" step — the deliverable a journal or reviewer wants.
-
-## When to use
-
-- Producing the reproducibility section / appendix for a paper.
-- Answering "what produced Figure 1?" or "what changed between run A and run B?"
-- Auditing a run before sharing it.
-
-## Runtime
-
-`../lib/provenance.py` (stdlib-only). Copy to the compute host once if working over SSH.
 
 ## Usage
 
@@ -30,14 +20,25 @@ Writes `reproducibility_appendix.md` inside the run dir (or to `--out`).
 ## What it produces
 
 - **Run metadata**: id, created-at, host/user, project, research question, seed.
-- **Git state**: commit, branch, dirty-tree hash. This is the code-provenance anchor — a committed script is pinned by the commit; an uncommitted one is pinned by the dirty-tree hash.
-- **Environment**: conda env exports + R sessionInfo files with their SHA-256s (the pin files).
-- **Executions table**: exec id → exit code → env → seed → command → inputs → outputs.
-- **Figure → Script → Env → Data → Seed map**: every figure output (png/jpeg/pdf/svg/tiff) mapped to its producing script (or command), env, seed, and input data. This is the table reviewers want.
+- **Git state**: commit, branch, dirty-tree hash — the code-provenance anchor.
+- **Environment**: every capture (method, confidence, detail, sha256) — conda env exports, pixi lockfiles, R sessionInfo, docker digests, etc.
+- **Executions table**: exec id → evidence label → exit → env → seed → command → inputs → outputs.
+- **Figure → Script → Env → Data → Seed map**: every figure output mapped to its producing script (or command), env, seed, and input data — with the evidence label so readers can see whether each figure was `observed`, `adopted`, or `inferred`.
+- **Decisions**: every recorded LLM decision (edge-case handling) — situation, choice, confidence, reason. This is the audit trail for *how* the system chose to capture things.
 - **Verdicts**: integrity + reproduction, from `provenance-verify`.
+
+## Evidence labels in the report
+
+The report is honest about evidence strength:
+- `observed` — the agent wrapped the run live (strongest).
+- `adopted` — recorded after the fact from evidence/history (medium; exit code may be unknown).
+- `inferred` — lineage asserted by a human, not observed (weakest).
+
+A reviewer can see at a glance which figures are backed by live observation and which are post-hoc reconstructions.
 
 ## Rules
 
 - Run `provenance-verify` before `report` so the verdicts are current; the report reflects whatever is in the manifest.
 - The report is derived from the manifest + event log — it is not a separate source of truth.
-- For a paper, paste the Executions + Figure map + Verdicts sections into the reproducibility appendix; the full run dir (manifest, event log, env pins, logs) is the supporting artifact you can point reviewers to.
+- For a paper, paste the Executions + Figure map + Decisions + Verdicts sections into the reproducibility appendix; the full run dir (manifest, event log, captures, logs) is the supporting artifact.
+- The Decisions section is what makes agentic provenance auditable: it shows not just *what* was captured but *why the system chose that capture method*.
